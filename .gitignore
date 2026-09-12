@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Build output
+dist/
+build/
+
+# Local lakehouse data (generated at runtime, not tracked)
+data/
+warehouse/
+metastore-data/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Swarm knowledge documents (runtime state, excluded from git)
+knowledge/
