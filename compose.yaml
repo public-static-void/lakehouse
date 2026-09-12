@@ -36,7 +36,7 @@ services:
     healthcheck:
       # If the pinned image lacks curl, swap for a TCP probe, e.g.
       # test: ["CMD-SHELL", "head -c 0 < /dev/tcp/127.0.0.1/9000 || exit 1"]
-      test: ["CMD-SHELL", "curl -sf -o /dev/null -X HEAD http://127.0.0.1:9000/ || exit 1"]
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9000 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -46,7 +46,7 @@ services:
     restart: unless-stopped
 
   bucket-setup:
-    image: amazon/aws-cli:2 # Freeze exact tag+digest after first pull (PLAN OQ01).
+    image: amazon/aws-cli:latest # Freeze exact tag+digest after first pull (PLAN OQ01).
     container_name: lakehouse-bucket-setup
     depends_on:
       rustfs:
@@ -63,8 +63,8 @@ services:
     # self-heals compose ordering races (E01). `warehouse` backs the Polaris
     # catalog storage config (SPEC Polaris REST contract); the other four are
     # the R003 contract buckets.
+    entrypoint: ["sh", "-c"]
     command: >
-      sh -c '
         set -eu;
         endpoint="$${S3_ENDPOINT_INTERNAL:-http://rustfs:9000}";
         attempt=0;
@@ -75,13 +75,12 @@ services:
           aws --endpoint-url "$$endpoint" s3 mb "s3://$$bucket" 2>&1 || true;
         done;
         echo "BUCKETS OK";
-      '
     mem_limit: 256m
     cpus: 0.5
 
   # --- Catalog (P004) -------------------------------------------------------
   polaris:
-    image: apache/polaris:1.0.0 # OQ01 implementation-time pin; freeze digest after first pull.
+    image: apache/polaris:1.0.0-incubating # OQ01 implementation-time pin; freeze digest after first pull.
     container_name: lakehouse-polaris
     ports:
       - "8181:8181" # Iceberg REST API.
