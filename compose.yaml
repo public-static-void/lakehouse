@@ -34,7 +34,8 @@ services:
     volumes:
       - rustfs-data:/data
     healthcheck:
-      # If the pinned image lacks curl, swap for a TCP probe, e.g.
+      # TCP probe (normative): S3 root returns 403 so no HTTP-status probe here.
+      # Fallback if nc is unavailable in the pinned image:
       # test: ["CMD-SHELL", "head -c 0 < /dev/tcp/127.0.0.1/9000 || exit 1"]
       test: ["CMD-SHELL", "nc -z 127.0.0.1 9000 || exit 1"]
       interval: 10s
