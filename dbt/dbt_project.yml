@@ -1,0 +1,30 @@
+name: lakehouse
+version: 1.0.0
+config-version: 2
+
+# dbt-duckdb is the stable gen-0 path (SPEC R007). The default `dev` target
+# runs fully local with no live stack; `prod` documents the dbt-trino
+# connection for the full profile. Fusion `catalogs.yml` v2 is explicitly
+# out of scope for gen-0 (SPEC dbt contract).
+profile: lakehouse
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+
+clean-targets:
+  - target
+  - dbt_packages
+  - logs
+
+models:
+  lakehouse:
+    bronze:
+      +materialized: view
+    silver:
+      +materialized: table
+    gold:
+      +materialized: table
+
+seeds:
+  lakehouse:
+    +quote_columns: false

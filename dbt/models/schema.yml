@@ -1,0 +1,44 @@
+version: 2
+
+# dbt tests for the Bronze -> Silver -> Gold chain (SPEC R007, PLAN P010).
+# The Silver dedup window guarantees one row per event_id; these tests
+# absorb the producer's duplicate/late injection (SPEC E09) by failing
+# loudly if dedup ever regresses.
+models:
+  - name: stg_events
+    description: Typed Bronze staging view (no filtering, no dedup).
+    columns:
+      - name: event_id
+        tests:
+          - not_null
+
+  - name: events
+    description: Silver deduplicated event table (one row per event_id,
+      latest load_time wins).
+    columns:
+      - name: event_id
+        tests:
+          - unique
+          - not_null
+      - name: load_time
+        tests:
+          - not_null
+      - name: source_system
+        tests:
+          - not_null
+      - name: batch_id
+        tests:
+          - not_null
+
+  - name: event_marts
+    description: Gold daily counts/revenue by event_type and country.
+    columns:
+      - name: event_date
+        tests:
+          - not_null
+      - name: event_type
+        tests:
+          - not_null
+      - name: country
+        tests:
+          - not_null

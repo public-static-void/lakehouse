@@ -1,0 +1,42 @@
+# dbt profile for the local lakehouse (SPEC R007/R009, PLAN P009).
+#
+# Default engine is DuckDB (minimal profile, no live stack needed):
+#   cd dbt && dbt build --profiles-dir .
+# Run against the live stack from the dbt-runner service (compose.yaml
+# mounts ./dbt at /work/dbt):
+#   docker compose exec dbt-runner sh -c 'cd /work/dbt && dbt build --profiles-dir .'
+#
+# Iceberg/Polaris wiring (documented, needs the live stack): DuckDB reaches
+# the Iceberg tables via the `iceberg` extension over the Polaris REST
+# catalog. Credentials and endpoints come from `.env` (see .env.example) so
+# no secret is committed here:
+#   POLARIS_CREDENTIAL  (client_id:client_secret, scope PRINCIPAL_ROLE:ALL)
+#   S3_ENDPOINT_INTERNAL=http://rustfs:9000 (in-container, path-style access)
+#   S3_ENDPOINT_EXTERNAL=http://localhost:9000 (host tooling)
+# Warehouse layout (SPEC S3-layout contract):
+#   s3://bronze/events/  (raw producer output, Iceberg namespace `bronze`)
+#   s3://silver/events/  (Iceberg table, namespace `silver`)
+#   s3://gold/event_marts/ (Iceberg table, namespace `gold`)
+lakehouse:
+  target: dev
+  outputs:
+    # Local DuckDB file — works with no compose stack (seeds + staging views).
+    dev:
+      type: duckdb
+      path: ../warehouse/dev.duckdb
+      threads: 4
+    # Full profile: dbt-trino against the Trino coordinator (compose
+    # `--profile full`, port 8080). Catalog `quickstart_catalog` is created
+    # by scripts/bootstrap-polaris.sh (realm POLARIS).
+    prod:
+      type: trino
+      catalog: quickstart_catalog
+      schema: gold
+      host: "{{ env_var('TRINO_HOST', 'localhost') }}"
+      port: "{{ env_var('TRINO_PORT', '8080') | int }}"
+      user: quickstart_user
+      password: "{{ env_var('POLARIS_CREDENTIAL', 'quickstart_user:CHANGE_ME').split(':')[1] }}"
+      http_scheme: http
+      session_properties:
+        query_max_memory: 5GB
+      threads: 4
