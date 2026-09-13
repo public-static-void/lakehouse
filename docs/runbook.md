@@ -154,6 +154,7 @@ unreachable — reported, exit 0 unless `--fail-on-mismatch`, which exits 2).
 | Polaris bootstrap 409 on re-run (E04) | Normal: create-or-skip treats it as success, `BOOTSTRAP OK`, exit 0 |
 | OOM on 8 GB laptop (E06) | Stay on `minimal` (default); `full` (Trino `-Xmx4G`, Airflow/Superset caps) needs ≥8 GB free |
 | Slow first start (E10) | `docker compose pull` first; minimal pulls only RustFS + Polaris + Python |
+| `bucket-setup` / `polaris-setup` missing from `compose ps` | By design: both are restart-less one-shots that exit 0 after success, so default `docker compose ps` (running-only) hides them — check `docker compose ps -a` for `exited (0)` plus `docker compose logs bucket-setup` / `docker compose logs polaris-setup` (`BUCKETS OK` / `BOOTSTRAP OK`); not a regression |
 
 ## 11. Extension stubs
 
