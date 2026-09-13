@@ -139,7 +139,9 @@ services:
       S3_ENDPOINT_INTERNAL: ${S3_ENDPOINT_INTERNAL:-http://rustfs:9000}
     volumes:
       - ./scripts/bootstrap-polaris.sh:/scripts/bootstrap-polaris.sh:ro
-    command: ["sh", "/scripts/bootstrap-polaris.sh"] # `sh` so no exec bit needed.
+    # Provide curl + jq before any health polling: bare alpine:3.21 ships
+    # neither, so the bootstrap health gate exits 127 without this preamble.
+    command: ["sh", "-c", "apk add --no-cache curl jq && sh /scripts/bootstrap-polaris.sh"] # `sh` so no exec bit needed.
     mem_limit: 256m
     cpus: 0.5
 
