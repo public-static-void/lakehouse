@@ -149,9 +149,24 @@ services:
   dbt-runner:
     image: python:3.12-slim # Reproducible container path (PLAN OQ02 primary).
     container_name: lakehouse-dbt-runner
-    # M5 mounts ./dbt and runs dbt build/test; shell keeps the service defined.
+    # M3 (gen4): exec-based workload wiring — `sleep infinity` is intentional
+    # so the one-shot dbt build/test below stays re-runnable via `exec`.
+    # Deps come from dbt/requirements.txt inside the container shell;
+    # image pin and resource caps unchanged per NFR004.
+    # One-shot dev build/test (after Bronze objects exist in s3://bronze):
+    #   docker compose exec dbt-runner pip install -r dbt/requirements.txt
+    #   docker compose exec dbt-runner sh -c 'cd /work/dbt && dbt build --profiles-dir .'
+    #   docker compose exec dbt-runner sh -c 'cd /work/dbt && dbt test --profiles-dir .'
+    # (dev profile: DuckDB ../warehouse/dev.duckdb; stg_events view,
+    # deduped silver.events, gold.event_marts; producer is exec-based
+    # long-running so Bronze ordering is documented, not a completed gate.)
     command: ["sleep", "infinity"]
     working_dir: /work
+    depends_on:
+      bucket-setup:
+        condition: service_completed_successfully
+      polaris-setup:
+        condition: service_completed_successfully
     volumes:
       - ./dbt:/work/dbt
       - warehouse-data:/work/warehouse
@@ -164,10 +179,27 @@ services:
     cpus: 1.0
 
   producer:
-    image: python:3.12-slim # + boto3,pyarrow,pyiceberg in M4.
+    image: python:3.12-slim
     container_name: lakehouse-producer
-    # M4 mounts ./producers and runs producers/events.py (one-shot default).
+    # M2 (gen4): exec-based workload wiring — `sleep infinity` is intentional
+    # so the one-shot Bronze run below stays re-runnable via `exec`.
+    # Deps come from producers/requirements.txt inside the container shell;
+    # image pin and resource caps unchanged per NFR004.
+    # One-shot Bronze run (after buckets + bootstrap are green):
+    #   docker compose exec producer pip install -r producers/requirements.txt
+    #   docker compose exec producer python producers/events.py \
+    #     --sink s3 --bronze-bucket bronze --seed 42
+    # (defaults: 500 rows x 20 batches = <=10k rows; endpoint from
+    # S3_ENDPOINT_INTERNAL=http://rustfs:9000, path-style, us-east-1.)
     command: ["sleep", "infinity"]
+    working_dir: /work
+    depends_on:
+      bucket-setup:
+        condition: service_completed_successfully
+      polaris-setup:
+        condition: service_completed_successfully
+    volumes:
+      - ./producers:/work/producers
     env_file:
       - .env
     environment:
