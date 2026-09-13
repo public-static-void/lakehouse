@@ -223,13 +223,15 @@ api_post "$MGMT/catalogs/$POLARIS_CATALOG/catalog-roles" \
   "catalog-role $POLARIS_CATALOG_ROLE"
 
 api_put "$MGMT/catalogs/$POLARIS_CATALOG/catalog-roles/$POLARIS_CATALOG_ROLE/grants" \
-  '{"type": "catalog", "privilege": "CATALOG_MANAGE_CONTENT"}' \
+  '{"grant": {"type": "catalog", "privilege": "CATALOG_MANAGE_CONTENT"}}' \
   "CATALOG_MANAGE_CONTENT on $POLARIS_CATALOG to $POLARIS_CATALOG_ROLE"
 
-api_put "$MGMT/principal-roles/$POLARIS_PRINCIPAL_ROLE/principals/$POLARIS_PRINCIPAL" \
-  "-" "principal-role $POLARIS_PRINCIPAL_ROLE to principal $POLARIS_PRINCIPAL"
+api_put "$MGMT/principals/$POLARIS_PRINCIPAL/principal-roles" \
+  "$(jq -n --arg name "$POLARIS_PRINCIPAL_ROLE" '{principalRole: {name: $name}}')" \
+  "principal-role $POLARIS_PRINCIPAL_ROLE to principal $POLARIS_PRINCIPAL"
 
-api_put "$MGMT/principal-roles/$POLARIS_PRINCIPAL_ROLE/catalog-roles/$POLARIS_CATALOG/catalog-roles/$POLARIS_CATALOG_ROLE" \
-  "-" "catalog-role $POLARIS_CATALOG_ROLE to principal-role $POLARIS_PRINCIPAL_ROLE"
+api_put "$MGMT/principal-roles/$POLARIS_PRINCIPAL_ROLE/catalog-roles/$POLARIS_CATALOG" \
+  "$(jq -n --arg name "$POLARIS_CATALOG_ROLE" '{catalogRole: {name: $name}}')" \
+  "catalog-role $POLARIS_CATALOG_ROLE to principal-role $POLARIS_PRINCIPAL_ROLE"
 
 log "BOOTSTRAP OK"
