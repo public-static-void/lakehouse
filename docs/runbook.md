@@ -68,6 +68,13 @@ If `polaris-setup` exits non-zero on the fallback runner, just re-run `up`
 
 ## 5. Seed (synthetic source)
 
+After any compose wiring change (mounts, `working_dir`, environment), recreate the
+workload containers before exec'ing into them:
+
+```sh
+docker compose up -d --force-recreate producer dbt-runner consumer
+```
+
 ```sh
 # Preview without S3 (no dependencies needed):
 python producers/events.py --sink stdout --batch-size 5 --max-batches 2 --seed 7
@@ -86,7 +93,7 @@ window) and late rows (`--late-rate`, backdated `event_time` 2–7 days).
 ```sh
 cd dbt && dbt build --profiles-dir . && dbt test --profiles-dir . && cd ..
 # Inside the stack instead (same layout via the warehouse-data mount):
-docker compose exec dbt-runner sh -c 'cd /work/dbt && dbt build --profiles-dir .'
+docker compose exec dbt-runner sh -c 'cd /work/dbt && dbt build --profiles-dir . && dbt test --profiles-dir .'
 ```
 
 `stg_events` (Bronze view) → `events` (Silver: typed, `op` filtered,
