@@ -48,6 +48,9 @@ services:
 
   bucket-setup:
     image: amazon/aws-cli:latest # Freeze exact tag+digest after first pull (PLAN OQ01).
+    # RepoDigests (host-verified 2026-09-12 via podman inspect, AC007):
+    #   docker.io/amazon/aws-cli@sha256:79979622af70b30fee35ef8b7dc105734709525e081f80810e51c2546bd89f4c
+    #   docker.io/amazon/aws-cli@sha256:e8467f2c319f9bc9a1471808a69949a76915e9c95eaf4a09ece9f9e85fd32747
     container_name: lakehouse-bucket-setup
     depends_on:
       rustfs:
@@ -82,6 +85,9 @@ services:
   # --- Catalog (P004) -------------------------------------------------------
   polaris:
     image: apache/polaris:1.0.0-incubating # OQ01 implementation-time pin; freeze digest after first pull.
+    # RepoDigests (host-verified 2026-09-12 via podman inspect, AC007):
+    #   docker.io/apache/polaris@sha256:82ba0c7b73bc476f0a37abf4d9f7e90960221600513d189af1ccc48ee9e4f71c
+    #   docker.io/apache/polaris@sha256:ace34373fe4a044d739792ad5afa918079a06f2bcbfb26e84eb2d2c9323effd1
     container_name: lakehouse-polaris
     ports:
       - "8181:8181" # Iceberg REST API.
