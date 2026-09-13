@@ -214,9 +214,28 @@ services:
   consumer:
     image: python:3.12-slim # Same image as producer (M6 wires verify.py).
     container_name: lakehouse-consumer
-    # M6 mounts ./consumers and runs consumers/verify.py checks + export.
+    # M4 (gen4): exec-based workload wiring — `sleep infinity` is intentional
+    # so the one-shot verify below stays re-runnable via `exec`.
+    # Deps come from consumers/requirements.txt inside the container shell;
+    # image pin and resource caps unchanged per NFR004.
+    # One-shot verify (after the dbt dev build/test are green):
+    #   docker compose exec consumer pip install -r consumers/requirements.txt
+    #   docker compose exec consumer python consumers/verify.py --engine duckdb
+    # (default engine duckdb, export on: prints RECONCILED when
+    # bronze>=1 and silver>=1 and 1<=gold<=silver, exit 0; Gold export
+    # lands at s3://gold-exports/date=YYYY-MM-DD/export.parquet.
+    # Endpoint from S3_ENDPOINT_INTERNAL=http://rustfs:9000, path-style,
+    # us-east-1. dbt-runner is exec-based long-running so the after-build
+    # ordering is documented, not a completed gate.)
     command: ["sleep", "infinity"]
     working_dir: /work
+    depends_on:
+      bucket-setup:
+        condition: service_completed_successfully
+      polaris-setup:
+        condition: service_completed_successfully
+      dbt-runner:
+        condition: service_started
     volumes:
       - ./consumers:/work/consumers
       - warehouse-data:/work/warehouse
