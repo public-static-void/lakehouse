@@ -63,20 +63,50 @@ services:
       AWS_REGION: us-east-1
       AWS_EC2_METADATA_DISABLED: "true"
       S3_ENDPOINT_INTERNAL: ${S3_ENDPOINT_INTERNAL:-http://rustfs:9000}
-    # Idempotent: `mb` failures (already-exists) are tolerated; the wait loop
-    # self-heals compose ordering races (E01). `warehouse` backs the Polaris
-    # catalog storage config (SPEC Polaris REST contract); the other four are
-    # the R003 contract buckets.
+    # Fail-hard contract (gen5 M1): probe -> create -> verify -> gated banner.
+    # 1. Readiness probe: bounded TCP connect on port 9000 (bash /dev/tcp
+    #    primary, nc -z fallback) — succeeds only when rustfs accepts S3
+    #    connections; never `aws s3 ls` (S3 root returns 403) and never a
+    #    bare fixed sleep. Self-heals compose ordering races under both
+    #    runners (E01/EC08).
+    # 2. Creation: each `aws s3 mb` fails hard — only already-exists errors
+    #    (BucketAlreadyOwnedByYou / BucketAlreadyExists) are tolerated for
+    #    idempotency (NFR001); any other failure aborts naming the bucket.
+    # 3. Verification: every contract bucket is head-bucket checked after
+    #    creation; a missing/unreachable bucket aborts naming it (EC03/EC04).
+    # 4. `BUCKETS OK` prints only after all five buckets verify (R004).
+    # `warehouse` backs the Polaris catalog storage config (SPEC Polaris REST
+    # contract); the other four are the data-path contract buckets.
     entrypoint: ["sh", "-c"]
     command: >
         set -eu;
         endpoint="$${S3_ENDPOINT_INTERNAL:-http://rustfs:9000}";
         attempt=0;
-        until aws --endpoint-url "$$endpoint" s3 ls >/dev/null 2>&1 || [ "$$attempt" -ge 12 ]; do
-          attempt=$$((attempt+1)); echo "waiting for rustfs ($$attempt/12)..."; sleep 5;
+        ready=0;
+        until [ "$$ready" -eq 1 ] || [ "$$attempt" -ge 12 ]; do
+          if (exec 3<>/dev/tcp/rustfs/9000) 2>/dev/null || nc -z rustfs 9000 2>/dev/null; then
+            ready=1;
+          else
+            attempt=$$((attempt+1)); echo "waiting for rustfs ($$attempt/12)..."; sleep 5;
+          fi;
+        done;
+        if [ "$$ready" -ne 1 ]; then
+          echo "ERROR: rustfs not accepting connections on port 9000 after 12 attempts" >&2; exit 1;
+        fi;
+        for bucket in bronze silver gold gold-exports warehouse; do
+          if aws --endpoint-url "$$endpoint" s3 mb "s3://$$bucket" 2>&1; then
+            echo "created $$bucket";
+          elif aws --endpoint-url "$$endpoint" s3api head-bucket --bucket "$$bucket" >/dev/null 2>&1; then
+            echo "created $$bucket (already exists)";
+          else
+            echo "ERROR: failed to create bucket $$bucket" >&2; exit 1;
+          fi;
         done;
         for bucket in bronze silver gold gold-exports warehouse; do
-          aws --endpoint-url "$$endpoint" s3 mb "s3://$$bucket" 2>&1 || true;
+          if ! aws --endpoint-url "$$endpoint" s3api head-bucket --bucket "$$bucket" >/dev/null 2>&1; then
+            echo "ERROR: bucket $$bucket missing or unreachable after creation" >&2; exit 1;
+          fi;
+          echo "verified $$bucket";
         done;
         echo "BUCKETS OK";
     mem_limit: 256m
