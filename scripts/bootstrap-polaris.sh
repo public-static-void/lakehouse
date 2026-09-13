@@ -8,7 +8,7 @@ set -eu
 # --- Config (from compose environment; sane quickstart defaults) ---
 POLARIS_HOST="${POLARIS_HOST:-http://polaris:8181}"
 POLARIS_HEALTH_URL="${POLARIS_HEALTH_URL:-http://polaris:8182/q/health}"
-POLARIS_BOOTSTRAP_CREDENTIALS="${POLARIS_BOOTSTRAP_CREDENTIALS:?set POLARIS_BOOTSTRAP_CREDENTIALS (id:secret)}"
+POLARIS_BOOTSTRAP_CREDENTIALS="${POLARIS_BOOTSTRAP_CREDENTIALS:?set POLARIS_BOOTSTRAP_CREDENTIALS (canonical triple REALM,clientId,clientSecret, e.g. POLARIS,root,<secret>; legacy clientId:clientSecret accepted)}"
 POLARIS_REALM="${POLARIS_REALM:-POLARIS}"
 POLARIS_CATALOG="${POLARIS_CATALOG:-quickstart_catalog}"
 POLARIS_PRINCIPAL="${POLARIS_PRINCIPAL:-quickstart_user}"
@@ -37,8 +37,29 @@ done
 log "Polaris is healthy."
 
 # --- 2. OAuth2 client-credentials token (bootstrap root credential) ---
-CLIENT_ID="${POLARIS_BOOTSTRAP_CREDENTIALS%%:*}"
-CLIENT_SECRET="${POLARIS_BOOTSTRAP_CREDENTIALS#*:}"
+# Canonical contract is the comma-triple realm,clientId,clientSecret
+# (e.g. POLARIS,root,<secret>); legacy clientId:clientSecret is accepted
+# when the value contains no comma.
+case "$POLARIS_BOOTSTRAP_CREDENTIALS" in
+  *,*,*)
+    _triple_rest="${POLARIS_BOOTSTRAP_CREDENTIALS#*,}"
+    CLIENT_ID="${_triple_rest%%,*}"
+    CLIENT_SECRET="${_triple_rest#*,}"
+    unset _triple_rest
+    ;;
+  *:*)
+    CLIENT_ID="${POLARIS_BOOTSTRAP_CREDENTIALS%%:*}"
+    CLIENT_SECRET="${POLARIS_BOOTSTRAP_CREDENTIALS#*:}"
+    ;;
+  *)
+    log "Invalid POLARIS_BOOTSTRAP_CREDENTIALS format: expected canonical triple REALM,clientId,clientSecret (e.g. POLARIS,root,<secret>); legacy clientId:clientSecret accepted."
+    exit 1
+    ;;
+esac
+if [ -z "${CLIENT_ID:-}" ] || [ -z "${CLIENT_SECRET:-}" ]; then
+  log "Invalid POLARIS_BOOTSTRAP_CREDENTIALS format: empty client id or secret (expected REALM,clientId,clientSecret triple; legacy clientId:clientSecret accepted)."
+  exit 1
+fi
 TOKEN_URL="$POLARIS_HOST/api/catalog/v1/oauth/tokens"
 TOKEN=""
 attempt=0
