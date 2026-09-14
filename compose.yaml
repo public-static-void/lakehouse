@@ -219,7 +219,10 @@ services:
     cpus: 1.0
 
   producer:
-    image: python:3.12-slim
+    build:
+      context: .
+      dockerfile: producers/Dockerfile
+    image: lakehouse-producer:local
     container_name: lakehouse-producer
     # M2 (gen4): exec-based workload wiring — `sleep infinity` is intentional
     # so the one-shot Bronze run below stays re-runnable via `exec`.
@@ -252,7 +255,10 @@ services:
     cpus: 0.5
 
   consumer:
-    image: python:3.12-slim # Same image as producer (M6 wires verify.py).
+    build:
+      context: .
+      dockerfile: consumers/Dockerfile
+    image: lakehouse-consumer:local
     container_name: lakehouse-consumer
     # M4 (gen4): exec-based workload wiring — `sleep infinity` is intentional
     # so the one-shot verify below stays re-runnable via `exec`.
