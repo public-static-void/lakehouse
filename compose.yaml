@@ -82,7 +82,12 @@ services:
     # `warehouse` backs the Polaris catalog storage config (SPEC Polaris REST
     # contract); the other four are the data-path contract buckets.
     entrypoint: ["sh", "-c"]
-    command: >
+    # Single-element list (not a folded `command: >` string): compose appends
+    # list items as whole argv elements, so podman-via-DOCKER_HOST cannot
+    # word-split the script into `sh -c set -eu; ...` (BASH_EXECUTION_STRING=set
+    # symptom — bare `set` env dump, zero gate lines). argv is `sh -c <script>`.
+    command:
+      - |
         set -eu;
         endpoint="$${S3_ENDPOINT_INTERNAL:-http://rustfs:9000}";
         echo "bucket-setup starting... endpoint=$$endpoint";
