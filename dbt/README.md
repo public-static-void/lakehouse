@@ -15,8 +15,12 @@ Against the live stack (minimal profile, `dbt-runner` service mounts
 `./dbt` at `/work/dbt`):
 
 ```sh
-docker compose exec dbt-runner sh -c 'cd /work/dbt && dbt build --profiles-dir .'
+docker compose exec dbt-runner sh -c 'pip install -q -r dbt/requirements.txt && cd /work/dbt && dbt seed --profiles-dir . && dbt build --profiles-dir .'
 ```
+
+`dbt seed` is mandatory before `dbt build`: it materializes
+`dev.bronze.events` (seed `bronze_events_sample` aliased into schema `bronze`),
+the relation `stg_events` reads via `{{ source('bronze', 'events') }}`.
 
 Full profile: `dbt build --profiles-dir . --target prod` runs the same
 models through Trino (`quickstart_catalog`, schema `gold`).
