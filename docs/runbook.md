@@ -55,7 +55,8 @@ cp .env.example .env
 docker compose pull           # explicit pull step: multi-GB first pull on slow links
 docker compose up -d          # minimal (default)
 docker compose --profile full up -d   # full (opt-in)
-docker compose ps             # rustfs/polaris healthy; polaris-setup completed
+docker compose ps -a          # one-shots must read Exited (0): bucket-setup, polaris-setup
+                              # (default `ps` hides exited containers — never gate on it)
 docker compose down           # stop, keep volumes (data survives)
 docker compose down -v        # stop + delete named volumes (full reset)
 podman volume rm lakehouse_rustfs-data lakehouse_polaris-data \
@@ -68,12 +69,20 @@ If `polaris-setup` exits non-zero on the fallback runner, just re-run `up`
 
 ## 5. Seed (synthetic source)
 
-After any compose wiring change (mounts, `working_dir`, environment), recreate the
-workload containers before exec'ing into them:
+After any compose wiring change (mounts, `working_dir`, environment), bring up the
+full stack first so the `service_completed_successfully` gates are honored,
+then recreate the workload containers before exec'ing into them:
 
 ```sh
+docker compose up -d                                    # full-stack up: honors bucket-setup/polaris-setup gates
 docker compose up -d --force-recreate producer dbt-runner consumer
 ```
+
+Gate warning: an explicit `up <service>` selection bypasses the
+`service_completed_successfully` gate — downstream shells come up over a
+missing-bucket foundation with no blocking error. Never treat
+`up producer dbt-runner consumer` alone as a green boot; `bucket-setup` must
+read `Exited (0)` (see §11) before any `exec` workload runs.
 
 ```sh
 # Preview without S3 (no dependencies needed):
@@ -84,6 +93,16 @@ python producers/events.py --sink s3 --rate 10 --batch-size 500 --max-batches 20
 python producers/events.py --sink s3 --loop --loop-max-batches 10 --seed 1
 ```
 
+Inside the stack (binding gate command — run only after `bucket-setup` is
+`Exited (0)`, see §11):
+
+```sh
+docker compose exec producer sh -c 'pip install -q -r producers/requirements.txt && python producers/events.py --sink s3 --bronze-bucket bronze --seed 42'
+```
+
+Expected: exit 0, batch/object lines, no `NoSuchBucket` traceback (proves
+`s3://bronze` exists and is writable).
+
 Determinism: same `--seed` replays the same `event_id`s, duplicates
 (`--dup-rate`, same id + bumped `load_time`, absorbed by the Silver dedup
 window) and late rows (`--late-rate`, backdated `event_time` 2–7 days).
@@ -91,10 +110,20 @@ window) and late rows (`--late-rate`, backdated `event_time` 2–7 days).
 ## 6. Transform (dbt Bronze → Silver → Gold)
 
 ```sh
-cd dbt && dbt build --profiles-dir . && dbt test --profiles-dir . && cd ..
+cd dbt && dbt seed --profiles-dir . && dbt build --profiles-dir . && dbt test --profiles-dir . && cd ..
 # Inside the stack instead (same layout via the warehouse-data mount):
-docker compose exec dbt-runner sh -c 'cd /work/dbt && dbt build --profiles-dir . && dbt test --profiles-dir .'
+docker compose exec dbt-runner sh -c 'pip install -q -r dbt/requirements.txt && cd /work/dbt && dbt seed --profiles-dir . && dbt build --profiles-dir .'
 ```
+
+`dbt seed` is mandatory before `dbt build`: it materializes
+`dev.bronze.events` (seed `bronze_events_sample` aliased into schema `bronze`),
+the relation `stg_events` reads via `{{ source('bronze', 'events') }}`.
+Expected: `dbt build` finishes `PASS` with zero `ERROR`; `stg_events`,
+`events`, and `event_marts` all report OK (skipping the seed reproduces
+`ERROR creating sql view model main.stg_events`: schema `bronze` missing).
+A singular test (`dbt/tests/bronze_seed_source_consistency.sql`) guards the
+seed↔source name contract — renaming either side fails `dbt test`/`dbt build`
+instead of surfacing later as a missing-schema error.
 
 `stg_events` (Bronze view) → `events` (Silver: typed, `op` filtered,
 `row_number() over (partition by event_id order by load_time desc)`
@@ -133,7 +162,15 @@ SELECT event_date, event_type, country, event_count, revenue
 python consumers/verify.py --engine duckdb --no-export   # offline-friendly check
 python consumers/verify.py --engine duckdb               # + Gold export
 python consumers/verify.py --engine trino --fail-on-mismatch   # full profile gate
+# Inside the stack (binding gate command — run only after dbt seed+build PASS, see §11):
+docker compose exec consumer sh -c 'pip install -q -r consumers/requirements.txt && python consumers/verify.py --engine duckdb'
 ```
+
+Expected: reconciled counts (bronze ≥1 object, silver ≥1 row,
+1 ≤ gold ≤ silver), verdict better than `UNKNOWN`, Gold export path
+`s3://gold-exports/date=YYYY-MM-DD/export.parquet`. `UNKNOWN` with
+`NoSuchBucket` / `Table with name events does not exist` means an upstream
+gate (§11 steps 1–3) was skipped, not a consumer defect.
 
 Prints Bronze S3 objects / Silver rows / Gold rows, `dbt test` status, and the
 export path `s3://gold-exports/date=YYYY-MM-DD/export.parquet` (or
@@ -163,7 +200,60 @@ unreachable — reported, exit 0 unless `--fail-on-mismatch`, which exits 2).
 | Slow first start (E10) | `docker compose pull` first; minimal pulls only RustFS + Polaris + Python |
 | `bucket-setup` / `polaris-setup` missing from `compose ps` | By design: both are restart-less one-shots that exit 0 after success, so default `docker compose ps` (running-only) hides them — check `docker compose ps -a` for `exited (0)` plus `docker compose logs bucket-setup` / `docker compose logs polaris-setup` (`BUCKETS OK` / `BOOTSTRAP OK`); not a regression |
 
-## 11. Extension stubs
+## 11. Host verification chain (binding gate)
+
+This chain is the binding pass criterion for the bucket + bronze fix. Run the
+steps in order on the host; a step that fails stops the chain (downstream
+`UNKNOWN`/`ERROR` is derivative, never a pass).
+
+```sh
+# 1. Full-stack up — honors service_completed_successfully (explicit `up <service>` bypasses it: invalid run):
+docker compose up -d
+docker compose up -d --force-recreate bucket-setup
+
+# 2. Bucket gate — UNFILTERED logs + exit code (narrow-grep-only gating is FORBIDDEN as a pass criterion):
+docker compose logs bucket-setup
+docker compose ps -a lakehouse-bucket-setup
+```
+
+Expected: startup line `bucket-setup starting... endpoint=...`, per-bucket
+`created <bucket>` (fresh) or `created <bucket> (already exists)` (rerun),
+five `verified <bucket>` lines, gated `BUCKETS OK`; `ps -a` reads
+`Exited (0)`. Exit codes: `0` = all five verified; `1` = probe/create/verify
+abort (an `ERROR` line names the cause); `2` = shell parse error (regression —
+the command must parse under POSIX `sh`).
+Negative discriminator: a passing run contains zero `ERROR` lines; any run
+whose unfiltered logs contain zero
+`created|verified|BUCKETS OK|ERROR|waiting|starting` lines is scored FAIL
+(script never ran — includes the grep-blind `waiting for rustfs (n/12)...`
+window and the early-read timing race), never PASS.
+
+```sh
+# 3. Bucket reachability from the host (all five must exit 0):
+for b in bronze silver gold gold-exports warehouse; do
+  aws --endpoint-url "${S3_ENDPOINT_EXTERNAL:-http://localhost:9000}" s3api head-bucket --bucket "$b"
+done
+
+# 4. Producer → dbt → consumer (exact commands; expected outputs in §§5/6/8):
+docker compose exec producer sh -c 'pip install -q -r producers/requirements.txt && python producers/events.py --sink s3 --bronze-bucket bronze --seed 42'
+docker compose exec dbt-runner sh -c 'pip install -q -r dbt/requirements.txt && cd /work/dbt && dbt seed --profiles-dir . && dbt build --profiles-dir .'
+docker compose exec consumer sh -c 'pip install -q -r consumers/requirements.txt && python consumers/verify.py --engine duckdb'
+```
+
+Expected: producer exit 0 with no `NoSuchBucket`; `dbt build` `PASS` with
+zero `ERROR` (`stg_events`/`events`/`event_marts` OK); consumer verdict better
+than `UNKNOWN` with reconciled counts. Rerun semantics: a second
+`up -d --force-recreate bucket-setup` ends `Exited (0)` with
+`(already exists)` + `BUCKETS OK` (idempotent, not a regression).
+
+Image-ground-truth record (host-only; run once per fresh pull and keep the output):
+`docker compose run --rm bucket-setup sh --version`;
+`docker compose run --rm bucket-setup sh -c 'command -v nc'`.
+Follow-ups (not this chain): live S3→DuckDB bronze load design; Polaris
+namespace/table bootstrap for `--target prod`
+(`quickstart_catalog.bronze.events`).
+
+## 12. Extension stubs
 
 `compose.yaml` ends with commented `profiles: [extensions]` blocks — one
 paragraph each, ports/volumes reserved, nothing starts: Kafka/Debezium (9092,
