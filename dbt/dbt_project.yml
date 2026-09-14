@@ -28,3 +28,11 @@ models:
 seeds:
   lakehouse:
     +quote_columns: false
+    # The sample seed IS the dev bronze relation: dbt seed materializes it
+    # as bronze.events (schema from the source name, identifier from the
+    # source table) so stg_events, which reads source('bronze', 'events'),
+    # resolves without any live stack. No database override here so each
+    # target keeps its own database/catalog (dev file, prod catalog).
+    bronze_events_sample:
+      +schema: bronze
+      +alias: events
