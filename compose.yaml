@@ -63,15 +63,19 @@ services:
       AWS_REGION: us-east-1
       AWS_EC2_METADATA_DISABLED: "true"
       S3_ENDPOINT_INTERNAL: ${S3_ENDPOINT_INTERNAL:-http://rustfs:9000}
-    # Fail-hard contract (gen5 M1): probe -> create -> verify -> gated banner.
-    # 1. Readiness probe: bounded TCP connect on port 9000 (bash /dev/tcp
-    #    primary, nc -z fallback) — succeeds only when rustfs accepts S3
-    #    connections; never `aws s3 ls` (S3 root returns 403) and never a
-    #    bare fixed sleep. Self-heals compose ordering races under both
-    #    runners (E01/EC08).
+    # Fail-hard contract (gen6 M1): probe -> create -> verify -> gated banner.
+    # 1. Readiness probe: bounded aws-native loop (`aws s3api list-buckets`
+    #    against the configured endpoint, 12 attempts with 5s backoff) using
+    #    only `sh` + the AWS CLI already present in this image — no shell
+    #    socket redirections, no extra network tools. Succeeds only when the
+    #    endpoint answers; never a bare fixed sleep. Self-heals compose
+    #    ordering races under both runners (E01/EC08). Prints a startup line
+    #    before the loop and one status line per attempt so script execution
+    #    is always distinguishable from silence under unfiltered logs.
     # 2. Creation: each `aws s3 mb` fails hard — only already-exists errors
-    #    (BucketAlreadyOwnedByYou / BucketAlreadyExists) are tolerated for
-    #    idempotency (NFR001); any other failure aborts naming the bucket.
+    #    (BucketAlreadyOwnedByYou / BucketAlreadyExists, confirmed by a
+    #    follow-up head-bucket) are tolerated for idempotency (NFR001); any
+    #    other failure aborts naming the bucket.
     # 3. Verification: every contract bucket is head-bucket checked after
     #    creation; a missing/unreachable bucket aborts naming it (EC03/EC04).
     # 4. `BUCKETS OK` prints only after all five buckets verify (R004).
@@ -81,22 +85,23 @@ services:
     command: >
         set -eu;
         endpoint="$${S3_ENDPOINT_INTERNAL:-http://rustfs:9000}";
+        echo "bucket-setup starting... endpoint=$$endpoint";
         attempt=0;
         ready=0;
         until [ "$$ready" -eq 1 ] || [ "$$attempt" -ge 12 ]; do
-          if (exec 3<>/dev/tcp/rustfs/9000) 2>/dev/null || nc -z rustfs 9000 2>/dev/null; then
+          if aws --endpoint-url "$$endpoint" s3api list-buckets >/dev/null 2>&1; then
             ready=1;
           else
-            attempt=$$((attempt+1)); echo "waiting for rustfs ($$attempt/12)..."; sleep 5;
+            attempt=$$((attempt+1)); echo "waiting for rustfs ($$attempt/12)... endpoint=$$endpoint"; sleep 5;
           fi;
         done;
         if [ "$$ready" -ne 1 ]; then
           echo "ERROR: rustfs not accepting connections on port 9000 after 12 attempts" >&2; exit 1;
         fi;
         for bucket in bronze silver gold gold-exports warehouse; do
-          if aws --endpoint-url "$$endpoint" s3 mb "s3://$$bucket" 2>&1; then
+          if out=$$(aws --endpoint-url "$$endpoint" s3 mb "s3://$$bucket" 2>&1); then
             echo "created $$bucket";
-          elif aws --endpoint-url "$$endpoint" s3api head-bucket --bucket "$$bucket" >/dev/null 2>&1; then
+          elif echo "$$out" | grep -E -q "BucketAlreadyOwnedByYou|BucketAlreadyExists" && aws --endpoint-url "$$endpoint" s3api head-bucket --bucket "$$bucket" >/dev/null 2>&1; then
             echo "created $$bucket (already exists)";
           else
             echo "ERROR: failed to create bucket $$bucket" >&2; exit 1;
