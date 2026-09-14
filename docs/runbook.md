@@ -236,7 +236,7 @@ done
 
 # 4. Producer → dbt → consumer (exact commands; expected outputs in §§5/6/8):
 docker compose exec producer sh -c 'pip install -q -r producers/requirements.txt && python producers/events.py --sink s3 --bronze-bucket bronze --seed 42'
-docker compose exec dbt-runner sh -c 'pip install -q -r dbt/requirements.txt && cd /work/dbt && dbt seed --profiles-dir . && dbt build --profiles-dir .'
+docker compose exec dbt-runner sh -c 'pip install -q -r dbt/requirements.txt && cd /work/dbt && dbt seed --full-refresh --profiles-dir . && dbt build --profiles-dir . && dbt test --profiles-dir .'
 docker compose exec consumer sh -c 'pip install -q -r consumers/requirements.txt && python consumers/verify.py --engine duckdb'
 ```
 
