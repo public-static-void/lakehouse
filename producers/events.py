@@ -81,6 +81,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "then S3_ENDPOINT_EXTERNAL, then http://localhost:9000.")
     parser.add_argument("--date", default=None,
                         help="dt partition (YYYY-MM-DD). Defaults to today in UTC.")
+    parser.add_argument("--no-throttle", action="store_true", default=False,
+                        help="Skip inter-batch rate-limit sleep for fast smoke tests. "
+                             "Default runs remain throttled.")
     return parser
 
 
@@ -171,14 +174,26 @@ def write_stdout(events: list[dict]) -> None:
         sys.stdout.write(json.dumps(event) + "\n")
 
 
-def write_s3(events: list[dict], *, bucket: str, day: str, batch_id: str,
-             index: int, fmt: str, endpoint: str) -> str:
-    """Upload one batch object. Returns the s3:// key written."""
+def get_s3_client(endpoint: str):
+    """Build one S3 client for the given endpoint. Created once per run()."""
     try:
         import boto3
         from botocore.config import Config
     except ImportError:
         raise SystemExit("boto3 is required for --sink s3: pip install -r producers/requirements.txt")
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        config=Config(s3={"addressing_style": "path"}),
+    )
+
+
+def write_s3(events: list[dict], *, bucket: str, day: str, batch_id: str,
+             index: int, fmt: str, endpoint: str, client=None) -> str:
+    """Upload one batch object. Returns the s3:// key written."""
     key = f"events/dt={day}/batch={batch_id}/part-{index:04d}.{fmt}"
     if fmt == "json":
         body = ("\n".join(json.dumps(e) for e in events) + "\n").encode("utf-8")
@@ -195,14 +210,8 @@ def write_s3(events: list[dict], *, bucket: str, day: str, batch_id: str,
         buf = io.BytesIO()
         pq.write_table(table, buf)
         body = buf.getvalue()
-    client = boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-        region_name=os.environ.get("AWS_REGION", "us-east-1"),
-        config=Config(s3={"addressing_style": "path"}),
-    )
+    if client is None:
+        client = get_s3_client(endpoint)
     client.put_object(Bucket=bucket, Key=key, Body=body)
     return f"s3://{bucket}/{key}"
 
@@ -219,6 +228,7 @@ def run(args: argparse.Namespace) -> int:
         parser.error("--bronze-bucket must be non-empty for --sink s3")
 
     rng = random.Random(args.seed)
+    client = get_s3_client(endpoint) if args.sink == "s3" else None
     written = 0
     for index in range(total_batches):
         batch_id = f"batch-{args.seed:05d}-{index:05d}"
@@ -226,12 +236,12 @@ def run(args: argparse.Namespace) -> int:
         if args.sink == "s3":
             key = write_s3(events, bucket=args.bronze_bucket, day=day,
                            batch_id=batch_id, index=index, fmt=args.format,
-                           endpoint=endpoint)
+                           endpoint=endpoint, client=client)
             print(f"batch {index + 1}/{total_batches}: {len(events)} events -> {key}")
         else:
             write_stdout(events)
         written += len(events)
-        if index < total_batches - 1 and args.rate > 0:
+        if index < total_batches - 1 and args.rate > 0 and not getattr(args, "no_throttle", False):
             time.sleep(len(events) / args.rate)
     if args.sink == "s3":
         print(f"done: {written} events in {total_batches} batches")
