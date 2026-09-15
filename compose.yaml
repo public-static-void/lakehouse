@@ -187,7 +187,10 @@ services:
 
   # --- Compute / IO shells (wired in M4/M5/M6; present here per R001/AC001) --
   dbt-runner:
-    image: python:3.12-slim # Reproducible container path (PLAN OQ02 primary).
+    build:
+      context: .
+      dockerfile: dbt/Dockerfile
+    image: lakehouse-dbt:local
     container_name: lakehouse-dbt-runner
     # M3 (gen4): exec-based workload wiring — `sleep infinity` is intentional
     # so the one-shot dbt build/test below stays re-runnable via `exec`.
