@@ -1,0 +1,586 @@
+# Local lakehouse — minimal profile (default stack).
+#
+# M2 scope (P003-P005): rustfs + bucket-setup + polaris + polaris-setup
+# (+ dbt-runner/producer/consumer shells; wired in M4/M5/M6).
+# M3 provides the `full` profile (trino/superset/airflow) and extension stubs.
+#
+# Primary runner:  docker compose  with  DOCKER_HOST=$XDG_RUNTIME_DIR/podman/podman.sock
+# Fallback runner: podman-compose (ignores health-gated depends_on; the retry
+# loops in bucket-setup / bootstrap-polaris.sh self-heal ordering races — E01).
+# Podman note: services run as separate containers (no pod) so default DNS
+# resolves service hostnames (rustfs, polaris). `localhost` is used ONLY for
+# host-published ports. Named volumes only — no bind-mounts for state.
+#
+# Image pins: tags frozen at M2 build time (PLAN OQ01 default). After the first
+# successful pull, record digests here, e.g.:
+#   docker pull <image> && docker inspect --format '{{.RepoDigests}}' <image>
+
+name: lakehouse
+
+services:
+  # --- Storage (P003) -------------------------------------------------------
+  rustfs:
+    image: rustfs/rustfs:1.0.0-alpha.81 # SPEC R003 normative pin.
+    container_name: lakehouse-rustfs
+    command: ["/data"] # SNSD single-disk mode: serve /data from one volume.
+    ports:
+      - "9000:9000" # S3 API (host access via S3_ENDPOINT_EXTERNAL).
+      - "9001:9001" # Console.
+    env_file:
+      - .env
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY}
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      # TCP probe (normative): S3 root returns 403 so no HTTP-status probe here.
+      # Fallback if nc is unavailable in the pinned image:
+      # test: ["CMD-SHELL", "head -c 0 < /dev/tcp/127.0.0.1/9000 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9000 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    mem_limit: 1g # NFR001: RustFS <= 1G.
+    cpus: 1.0
+    restart: unless-stopped
+
+  bucket-setup:
+    image: amazon/aws-cli:latest # Freeze exact tag+digest after first pull (PLAN OQ01).
+    # RepoDigests (host-verified 2026-09-12 via podman inspect, AC007):
+    #   docker.io/amazon/aws-cli@sha256:79979622af70b30fee35ef8b7dc105734709525e081f80810e51c2546bd89f4c
+    #   docker.io/amazon/aws-cli@sha256:e8467f2c319f9bc9a1471808a69949a76915e9c95eaf4a09ece9f9e85fd32747
+    container_name: lakehouse-bucket-setup
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY}
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+      S3_ENDPOINT_INTERNAL: ${S3_ENDPOINT_INTERNAL:-http://rustfs:9000}
+    # Fail-hard contract (gen6 M1): probe -> create -> verify -> gated banner.
+    # 1. Readiness probe: bounded aws-native loop (`aws s3api list-buckets`
+    #    against the configured endpoint, 12 attempts with 5s backoff) using
+    #    only `sh` + the AWS CLI already present in this image — no shell
+    #    socket redirections, no extra network tools. Succeeds only when the
+    #    endpoint answers; never a bare fixed sleep. Self-heals compose
+    #    ordering races under both runners (E01/EC08). Prints a startup line
+    #    before the loop and one status line per attempt so script execution
+    #    is always distinguishable from silence under unfiltered logs.
+    # 2. Creation: each `aws s3 mb` fails hard — only already-exists errors
+    #    (BucketAlreadyOwnedByYou / BucketAlreadyExists, confirmed by a
+    #    follow-up head-bucket) are tolerated for idempotency (NFR001); any
+    #    other failure aborts naming the bucket.
+    # 3. Verification: every contract bucket is head-bucket checked after
+    #    creation; a missing/unreachable bucket aborts naming it (EC03/EC04).
+    # 4. `BUCKETS OK` prints only after all five buckets verify (R004).
+    # `warehouse` backs the Polaris catalog storage config (SPEC Polaris REST
+    # contract); the other four are the data-path contract buckets.
+    entrypoint: ["sh", "-c"]
+    # Single-element list (not a folded `command: >` string): compose appends
+    # list items as whole argv elements, so podman-via-DOCKER_HOST cannot
+    # word-split the script into `sh -c set -eu; ...` (BASH_EXECUTION_STRING=set
+    # symptom — bare `set` env dump, zero gate lines). argv is `sh -c <script>`.
+    command:
+      - |
+        set -eu;
+        endpoint="$${S3_ENDPOINT_INTERNAL:-http://rustfs:9000}";
+        echo "bucket-setup starting... endpoint=$$endpoint";
+        attempt=0;
+        ready=0;
+        until [ "$$ready" -eq 1 ] || [ "$$attempt" -ge 12 ]; do
+          if aws --endpoint-url "$$endpoint" s3api list-buckets >/dev/null 2>&1; then
+            ready=1;
+          else
+            attempt=$$((attempt+1)); echo "waiting for rustfs ($$attempt/12)... endpoint=$$endpoint"; sleep 5;
+          fi;
+        done;
+        if [ "$$ready" -ne 1 ]; then
+          echo "ERROR: rustfs not accepting connections on port 9000 after 12 attempts" >&2; exit 1;
+        fi;
+        for bucket in bronze silver gold gold-exports warehouse; do
+          if out=$$(aws --endpoint-url "$$endpoint" s3 mb "s3://$$bucket" 2>&1); then
+            echo "created $$bucket";
+          elif echo "$$out" | grep -E -q "BucketAlreadyOwnedByYou|BucketAlreadyExists" && aws --endpoint-url "$$endpoint" s3api head-bucket --bucket "$$bucket" >/dev/null 2>&1; then
+            echo "created $$bucket (already exists)";
+          else
+            echo "ERROR: failed to create bucket $$bucket" >&2; exit 1;
+          fi;
+        done;
+        for bucket in bronze silver gold gold-exports warehouse; do
+          if ! aws --endpoint-url "$$endpoint" s3api head-bucket --bucket "$$bucket" >/dev/null 2>&1; then
+            echo "ERROR: bucket $$bucket missing or unreachable after creation" >&2; exit 1;
+          fi;
+          echo "verified $$bucket";
+        done;
+        echo "BUCKETS OK";
+    mem_limit: 256m
+    cpus: 0.5
+
+  # --- Catalog (P004) -------------------------------------------------------
+  polaris:
+    image: apache/polaris:1.0.0-incubating # OQ01 implementation-time pin; freeze digest after first pull.
+    # RepoDigests (host-verified 2026-09-12 via podman inspect, AC007):
+    #   docker.io/apache/polaris@sha256:82ba0c7b73bc476f0a37abf4d9f7e90960221600513d189af1ccc48ee9e4f71c
+    #   docker.io/apache/polaris@sha256:ace34373fe4a044d739792ad5afa918079a06f2bcbfb26e84eb2d2c9323effd1
+    container_name: lakehouse-polaris
+    ports:
+      - "8181:8181" # Iceberg REST API.
+      - "8182:8182" # Health.
+    env_file:
+      - .env
+    environment:
+      POLARIS_BOOTSTRAP_CREDENTIALS: ${POLARIS_BOOTSTRAP_CREDENTIALS}
+      # S3 wiring consumed by polaris-setup when registering the catalog
+      # storage config (SPEC interface contract: external + internal
+      # endpoints, path-style access; E03 dual-endpoint rule).
+      endpoint: ${S3_ENDPOINT_EXTERNAL:-http://localhost:9000}
+      endpointInternal: ${S3_ENDPOINT_INTERNAL:-http://rustfs:9000}
+      pathStyleAccess: "true"
+      AWS_REGION: us-east-1
+    volumes:
+      # Reserved for a file-backed metastore; unused in gen-0 in-memory mode.
+      - polaris-data:/var/lib/polaris
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8182/q/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    mem_limit: 1g # NFR001: Polaris <= 1G.
+    cpus: 1.0
+    restart: unless-stopped
+
+  polaris-setup:
+    image: alpine:3.21 # Freeze digest after first pull (PLAN OQ01).
+    container_name: lakehouse-polaris-setup
+    # service_started (not healthy) on purpose: the bootstrap retry loop
+    # self-heals ordering races and stays podman-compose compatible (E01).
+    depends_on:
+      polaris:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      POLARIS_HOST: http://polaris:8181
+      POLARIS_HEALTH_URL: http://polaris:8182/q/health
+      POLARIS_BOOTSTRAP_CREDENTIALS: ${POLARIS_BOOTSTRAP_CREDENTIALS}
+      POLARIS_REALM: POLARIS
+      POLARIS_CATALOG: quickstart_catalog
+      POLARIS_PRINCIPAL: quickstart_user
+      POLARIS_PRINCIPAL_ROLE: quickstart_principal_role
+      POLARIS_CATALOG_ROLE: quickstart_catalog_role
+      S3_WAREHOUSE_LOCATION: s3://warehouse/
+      S3_ENDPOINT_INTERNAL: ${S3_ENDPOINT_INTERNAL:-http://rustfs:9000}
+    volumes:
+      - ./scripts/bootstrap-polaris.sh:/scripts/bootstrap-polaris.sh:ro
+    # Provide curl + jq before any health polling: bare alpine:3.21 ships
+    # neither, so the bootstrap health gate exits 127 without this preamble.
+    command: ["sh", "-c", "apk add --no-cache curl jq && sh /scripts/bootstrap-polaris.sh"] # `sh` so no exec bit needed.
+    mem_limit: 256m
+    cpus: 0.5
+
+  # --- Compute / IO shells (wired in M4/M5/M6; present here per R001/AC001) --
+  dbt-runner:
+    build:
+      context: .
+      dockerfile: dbt/Dockerfile
+    image: lakehouse-dbt:local
+    container_name: lakehouse-dbt-runner
+    # M3 (gen4): exec-based workload wiring — `sleep infinity` is intentional
+    # so the one-shot dbt build/test below stays re-runnable via `exec`.
+    # Deps come from dbt/requirements.txt inside the container shell;
+    # image pin and resource caps unchanged per NFR004.
+    # One-shot dev build/test (after Bronze objects exist in s3://bronze):
+    #   docker compose exec dbt-runner pip install -r dbt/requirements.txt
+    #   docker compose exec dbt-runner sh -c 'cd /work/dbt && dbt build --profiles-dir .'
+    #   docker compose exec dbt-runner sh -c 'cd /work/dbt && dbt test --profiles-dir .'
+    # (dev profile: DuckDB ../warehouse/dev.duckdb; stg_events view,
+    # deduped silver.events, gold.event_marts; producer is exec-based
+    # long-running so Bronze ordering is documented, not a completed gate.)
+    command: ["sleep", "infinity"]
+    working_dir: /work
+    depends_on:
+      bucket-setup:
+        condition: service_completed_successfully
+      polaris-setup:
+        condition: service_completed_successfully
+    volumes:
+      - ./dbt:/work/dbt
+      - warehouse-data:/work/warehouse
+    env_file:
+      - .env
+    environment:
+      S3_ENDPOINT_INTERNAL: ${S3_ENDPOINT_INTERNAL:-http://rustfs:9000}
+      POLARIS_CREDENTIAL: ${POLARIS_CREDENTIAL}
+    mem_limit: 1g
+    cpus: 1.0
+
+  producer:
+    build:
+      context: .
+      dockerfile: producers/Dockerfile
+    image: lakehouse-producer:local
+    container_name: lakehouse-producer
+    # M2 (gen4): exec-based workload wiring — `sleep infinity` is intentional
+    # so the one-shot Bronze run below stays re-runnable via `exec`.
+    # Deps come from producers/requirements.txt inside the container shell;
+    # image pin and resource caps unchanged per NFR004.
+    # One-shot Bronze run (after buckets + bootstrap are green):
+    #   docker compose exec producer pip install -r producers/requirements.txt
+    #   docker compose exec producer python producers/events.py \
+    #     --sink s3 --bronze-bucket bronze --seed 42
+    # (defaults: 500 rows x 20 batches = <=10k rows; endpoint from
+    # S3_ENDPOINT_INTERNAL=http://rustfs:9000, path-style, us-east-1.)
+    command: ["sleep", "infinity"]
+    working_dir: /work
+    depends_on:
+      bucket-setup:
+        condition: service_completed_successfully
+      polaris-setup:
+        condition: service_completed_successfully
+    volumes:
+      - ./producers:/work/producers
+    env_file:
+      - .env
+    environment:
+      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY}
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+      S3_ENDPOINT_INTERNAL: ${S3_ENDPOINT_INTERNAL:-http://rustfs:9000}
+    mem_limit: 512m
+    cpus: 0.5
+
+  consumer:
+    build:
+      context: .
+      dockerfile: consumers/Dockerfile
+    image: lakehouse-consumer:local
+    container_name: lakehouse-consumer
+    # M4 (gen4): exec-based workload wiring — `sleep infinity` is intentional
+    # so the one-shot verify below stays re-runnable via `exec`.
+    # Deps come from consumers/requirements.txt inside the container shell;
+    # image pin and resource caps unchanged per NFR004.
+    # One-shot verify (after the dbt dev build/test are green):
+    #   docker compose exec consumer pip install -r consumers/requirements.txt
+    #   docker compose exec consumer python consumers/verify.py --engine duckdb
+    # (default engine duckdb, export on: prints RECONCILED when
+    # bronze>=1 and silver>=1 and 1<=gold<=silver, exit 0; Gold export
+    # lands at s3://gold-exports/date=YYYY-MM-DD/export.parquet.
+    # Endpoint from S3_ENDPOINT_INTERNAL=http://rustfs:9000, path-style,
+    # us-east-1. dbt-runner is exec-based long-running so the after-build
+    # ordering is documented, not a completed gate.)
+    command: ["sleep", "infinity"]
+    working_dir: /work
+    depends_on:
+      bucket-setup:
+        condition: service_completed_successfully
+      polaris-setup:
+        condition: service_completed_successfully
+      dbt-runner:
+        condition: service_started
+    volumes:
+      - ./consumers:/work/consumers
+      - warehouse-data:/work/warehouse
+    env_file:
+      - .env
+    environment:
+      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY}
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+      S3_ENDPOINT_INTERNAL: ${S3_ENDPOINT_INTERNAL:-http://rustfs:9000}
+      POLARIS_CREDENTIAL: ${POLARIS_CREDENTIAL}
+    mem_limit: 512m
+    cpus: 0.5
+
+  # --- Full profile (P006, opt-in via --profile full) -------------------------
+  # Nothing below starts by default: minimal stays the lightweight default
+  # (NFR001); full adds the central SQL engine (Trino), BI (Superset) and
+  # orchestration (Airflow). Stay on minimal on <8 GB RAM hosts (E06).
+  trino:
+    image: trinodb/trino:483 # SPEC R002/R009 normative pin.
+    container_name: lakehouse-trino
+    profiles: ["full"]
+    depends_on:
+      polaris-setup:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080" # Trino coordinator + UI.
+    env_file:
+      - .env
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx4G" # NFR001: heap cap inside the 4G container limit.
+      AWS_REGION: us-east-1
+      # query.max-memory=5GB is a coordinator setting (config.properties):
+      # apply it via a mounted trino/etc/config.properties override when
+      # tuning beyond the stock single-node default.
+    volumes:
+      - ./trino/catalog/polaris.properties:/etc/trino/catalog/polaris.properties:ro
+      - trino-data:/data/trino
+    healthcheck:
+      # If the pinned image lacks curl, swap for a TCP probe, e.g.
+      # test: ["CMD-SHELL", "head -c 0 < /dev/tcp/127.0.0.1/8080 || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/v1/info || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+    mem_limit: 4g # NFR001: Trino full-profile bound.
+    cpus: 2.0
+    restart: unless-stopped
+
+  superset-postgres:
+    image: postgres:16-alpine # Freeze exact tag+digest after first pull (PLAN OQ01).
+    container_name: lakehouse-superset-postgres
+    profiles: ["full"]
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: superset
+      POSTGRES_DB: superset
+      # Local-demo simplification: reuses the Airflow metastore password so no
+      # new secret enters the .env contract (M1 AC010 key set unchanged).
+      POSTGRES_PASSWORD: ${AIRFLOW_METASTORE_PASSWORD}
+    volumes:
+      - superset-meta:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U superset -d superset || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    mem_limit: 512m
+    cpus: 0.5
+    restart: unless-stopped
+
+  superset:
+    image: apache/superset:5.0.0 # OQ03 plan default: stays in full (not extensions).
+    container_name: lakehouse-superset
+    profiles: ["full"]
+    depends_on:
+      superset-postgres:
+        condition: service_healthy
+    ports:
+      - "8088:8088" # Superset web UI (default admin/admin after init; see runbook M6).
+    env_file:
+      - .env
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      TALISMAN_ENABLED: "false" # Local http demo; enable TLS + Talisman beyond gen-0.
+      SQLALCHEMY_DATABASE_URI: postgresql://superset:${AIRFLOW_METASTORE_PASSWORD}@superset-postgres:5432/superset
+    # Idempotent init: admin create skipped when present (|| true).
+    command: >
+      sh -c '
+        set -eu;
+        superset db upgrade;
+        superset fab create-admin --username admin --firstname lake --lastname house
+          --email admin@lakehouse.local --password admin 2>&1 || true;
+        superset init;
+        gunicorn --bind 0.0.0.0:8088 --workers 2 --threads 4 "superset.app:create_app()";
+      '
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import sys,urllib.request; sys.exit(0 if urllib.request.urlopen(\"http://127.0.0.1:8088/login\").status == 200 else 1)'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+    mem_limit: 1g
+    cpus: 1.0
+    restart: unless-stopped
+
+  airflow-postgres:
+    image: postgres:16-alpine # Freeze exact tag+digest after first pull (PLAN OQ01).
+    container_name: lakehouse-airflow-postgres
+    profiles: ["full"]
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_DB: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_METASTORE_PASSWORD}
+    volumes:
+      - airflow-meta:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    mem_limit: 512m
+    cpus: 0.5
+    restart: unless-stopped
+
+  airflow:
+    image: apache/airflow:2.10.4 # Pinned at M3 build; freeze digest after first pull.
+    container_name: lakehouse-airflow
+    profiles: ["full"]
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+    ports:
+      - "8081:8080" # Airflow webserver (host 8081; container 8080).
+    env_file:
+      - .env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor # Gen-0 single-container demo.
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # airflow-postgres above is reserved for the LocalExecutor upgrade
+      # (extension point); standalone below uses sqlite so gen-0 needs no
+      # DB migration. Airflow + postgres stay within 2G total (1g + 512m).
+    command: ["standalone"] # Scheduler + webserver + triggerer in one process.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+    mem_limit: 1g
+    cpus: 1.0
+    restart: unless-stopped
+
+volumes:
+  rustfs-data: # Single-disk SNSD backing (R003).
+  polaris-data: # Reserved for file-backed metastore (in-memory in gen-0).
+  warehouse-data: # M5: DuckDB dev database shared with dbt-runner (/work/warehouse).
+  trino-data: # Full profile: Trino spill/staging (R014-full).
+  superset-meta: # Full profile: Superset metadata postgres (R014-full).
+  airflow-meta: # Full profile: Airflow metadata postgres (R014-full).
+
+# --- Extension stubs (P007, inactive) -----------------------------------------
+# Deferred components from SPEC R016 exist ONLY as commented stubs below: they
+# reserve ports/volumes and carry a one-paragraph note each. To activate one,
+# uncomment its block, switch `profiles: [extensions]` on, and run with
+# `--profile extensions`. All referenced images are FOSS-only (NFR002); no
+# cloud endpoint or vendor SaaS appears anywhere in this file (AC018).
+#
+# Kafka + Debezium (streaming ingestion, reserved 9092/8083): real CDC/log
+# sources land here when the synthetic producer is no longer enough; connect
+# workers sink Debezium change events to Bronze while Kafka buffers bursts.
+#   kafka:
+#     image: apache/kafka:3.9.0
+#     profiles: [extensions]
+#     ports: ["9092:9092"]
+#     volumes: [kafka-data:/var/lib/kafka/data]
+#   connect:
+#     image: debezium/connect:2.7
+#     profiles: [extensions]
+#     ports: ["8083:8083"]
+#     volumes: [connect-data:/kafka/connect]
+#
+# Spark + Flink (distributed compute, reserved 8082/4040/8084): Spark takes
+# over heavy batch/ML transforms that outgrow dbt-duckdb, while Flink adds
+# true streaming over Kafka for sub-minute Silver updates.
+#   spark-master:
+#     image: apache/spark:3.5.3
+#     profiles: [extensions]
+#     ports: ["8082:8080", "4040:4040"]
+#     volumes: [spark-data:/opt/spark/work]
+#   flink-jobmanager:
+#     image: flink:1.20.1-scala_2.12-java17
+#     profiles: [extensions]
+#     ports: ["8084:8081"]
+#     volumes: [flink-data:/opt/flink/checkpoints]
+#
+# NiFi (visual dataflow, reserved 8443): drag-and-drop ingestion routing for
+# file/API sources that do not fit the producer script or Kafka connectors.
+#   nifi:
+#     image: apache/nifi:2.0.0
+#     profiles: [extensions]
+#     ports: ["8443:8443"]
+#     volumes: [nifi-data:/opt/nifi/nifi-current/flowfile_repository]
+#
+# ClickHouse (OLAP serving, reserved 8123/9002): Gold marts are replicated
+# here for low-latency dashboards when DuckDB/Trino ad-hoc queries are not
+# fast enough; native port uses 9002 because 9000 belongs to RustFS S3.
+#   clickhouse:
+#     image: clickhouse/clickhouse-server:24.12-alpine
+#     profiles: [extensions]
+#     ports: ["8123:8123", "9002:9000"]
+#     volumes: [clickhouse-data:/var/lib/clickhouse]
+#
+# Airbyte + Meltano (declarative EL, reserved 8000): managed connector
+# ingestion that replaces/augments the custom synthetic producer (ANALYSIS
+# M2); Meltano is CLI-only and needs no port.
+#   airbyte-server:
+#     image: airbyte/server:0.63.0
+#     profiles: [extensions]
+#     ports: ["8000:8000"]
+#     volumes: [airbyte-data:/data]
+#   meltano:
+#     image: meltano/meltano:v3.6.0
+#     profiles: [extensions]
+#     command: ["run", "tap-events", "target-iceberg"]
+#
+# OpenMetadata + OpenLineage/Marquez (governance, reserved 8585/5000):
+# dataset cataloging, ownership and column-lineage over Polaris/Iceberg and
+# dbt, complementing the runbook-level docs of gen-0.
+#   openmetadata-server:
+#     image: openmetadata/server:1.6.2
+#     profiles: [extensions]
+#     ports: ["8585:8585"]
+#     volumes: [openmetadata-data:/opt/openmetadata]
+#   marquez:
+#     image: marquezproject/marquez:0.45.0
+#     profiles: [extensions]
+#     ports: ["5000:5000"]
+#
+# Keycloak + OPA + OpenBao (SSO/policy/secrets, reserved 8090/8183/8200):
+# Keycloak replaces the single quickstart_user with real SSO, OPA gates
+# table-level policies in front of Trino, and OpenBao stores the .env
+# secrets that gen-0 keeps in a local file (NFR006).
+#   keycloak:
+#     image: quay.io/keycloak/keycloak:26.0.6
+#     profiles: [extensions]
+#     ports: ["8090:8080"]
+#     volumes: [keycloak-data:/opt/keycloak/data]
+#   opa:
+#     image: openpolicyagent/opa:1.1.0
+#     profiles: [extensions]
+#     ports: ["8183:8181"]
+#   openbao:
+#     image: openbao/openbao:2.2.0
+#     profiles: [extensions]
+#     ports: ["8200:8200"]
+#     volumes: [openbao-data:/var/lib/openbao]
+#
+# Prometheus + Grafana + Loki (observability, reserved 9090/3000/3100):
+# container metrics, lakehouse dashboards and log aggregation for the whole
+# stack; scrape configs mount read-only from ./observability/ when added.
+#   prometheus:
+#     image: prom/prometheus:v3.0.1
+#     profiles: [extensions]
+#     ports: ["9090:9090"]
+#     volumes: [prometheus-data:/prometheus]
+#   grafana:
+#     image: grafana/grafana:11.4.0
+#     profiles: [extensions]
+#     ports: ["3000:3000"]
+#     volumes: [grafana-data:/var/lib/grafana]
+#   loki:
+#     image: grafana/loki:3.3.0
+#     profiles: [extensions]
+#     ports: ["3100:3100"]
+#     volumes: [loki-data:/loki]
+#
+# Reserved extension volumes (uncomment alongside the service that uses them):
+#   kafka-data: {}
+#   connect-data: {}
+#   spark-data: {}
+#   flink-data: {}
+#   nifi-data: {}
+#   clickhouse-data: {}
+#   airbyte-data: {}
+#   openmetadata-data: {}
+#   keycloak-data: {}
+#   openbao-data: {}
+#   prometheus-data: {}
+#   grafana-data: {}
+#   loki-data: {}

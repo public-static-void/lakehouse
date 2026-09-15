@@ -1,0 +1,32 @@
+version: 2
+
+# Iceberg namespaces registered in Polaris (SPEC R005 warehouse contract).
+# Backed by the S3 prefixes from the S3-layout contract:
+#   bronze namespace -> s3://bronze/events/
+#   silver namespace -> s3://silver/events/      (Iceberg table data + metadata)
+#   gold   namespace -> s3://gold/event_marts/   (Iceberg table data + metadata)
+sources:
+  - name: bronze
+    description: Raw Bronze events written by producers/events.py
+      (dt/batch partitioned JSON/Parquet under s3://bronze/events/).
+    tables:
+      - name: events
+        description: Untyped producer output with the 11-field contract
+          (event_id, event_time, source_system, load_time, batch_id, op
+          plus user_id, event_type, amount, currency, country).
+
+  - name: silver
+    description: Cleaned Iceberg namespace (s3://silver/events/).
+    tables:
+      - name: events
+        description: Typed/cleaned/deduped Silver table built by
+          models/silver/events.sql; read directly by engines that
+          bypass the dbt ref graph (e.g. Trino ad-hoc queries).
+
+  - name: gold
+    description: Marts Iceberg namespace (s3://gold/event_marts/).
+    tables:
+      - name: event_marts
+        description: Daily counts/revenue by event_type/country built by
+          models/gold/event_marts.sql and exported to
+          s3://gold-exports/ by consumers/verify.py.

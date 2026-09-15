@@ -19,6 +19,12 @@ venv/
 dist/
 build/
 
+# dbt build output (runtime-generated, not tracked)
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+dbt/.user.yml
+
 # Local lakehouse data (generated at runtime, not tracked)
 data/
 warehouse/

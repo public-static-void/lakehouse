@@ -1,0 +1,8 @@
+# dbt runtime dependencies (local-only, FOSS).
+# Minimal profile needs only the DuckDB path:
+#   pip install -r requirements.txt
+# Full profile additionally needs the Trino adapter (installed from the
+# same file so one requirements file covers both compose profiles).
+dbt-duckdb>=1.8
+duckdb>=1.0
+dbt-trino>=1.8

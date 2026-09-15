@@ -1,0 +1,38 @@
+name: lakehouse
+version: 1.0.0
+config-version: 2
+
+# dbt-duckdb is the stable gen-0 path (SPEC R007). The default `dev` target
+# runs fully local with no live stack; `prod` documents the dbt-trino
+# connection for the full profile. Fusion `catalogs.yml` v2 is explicitly
+# out of scope for gen-0 (SPEC dbt contract).
+profile: lakehouse
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+
+clean-targets:
+  - target
+  - dbt_packages
+  - logs
+
+models:
+  lakehouse:
+    bronze:
+      +materialized: view
+    silver:
+      +materialized: table
+    gold:
+      +materialized: table
+
+seeds:
+  lakehouse:
+    +quote_columns: false
+    # The sample seed IS the dev bronze relation: dbt seed materializes it
+    # as bronze.events (schema from the source name, identifier from the
+    # source table) so stg_events, which reads source('bronze', 'events'),
+    # resolves without any live stack. No database override here so each
+    # target keeps its own database/catalog (dev file, prod catalog).
+    bronze_events_sample:
+      +schema: bronze
+      +alias: events
