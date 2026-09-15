@@ -91,6 +91,9 @@ python producers/events.py --sink stdout --batch-size 5 --max-batches 2 --seed 7
 python producers/events.py --sink s3 --rate 10 --batch-size 500 --max-batches 20 --seed 42
 # Continuous mode needs an explicit bound:
 python producers/events.py --sink s3 --loop --loop-max-batches 10 --seed 1
+# Fast smoke (<30s) for quick verification — opt-in only, default 20-batch runs stay throttled:
+python producers/events.py --sink s3 --no-throttle --max-batches 2 --rate 100 --batch-size 500 --seed 42 --bronze-bucket bronze
+# Alternative without the flag (also <30s): --rate 100 --max-batches 2
 ```
 
 Inside the stack (binding gate command — run only after `bucket-setup` is
